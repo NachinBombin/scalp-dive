@@ -9,6 +9,7 @@ local BACK_OFFSET = 55
 local FLAME_SCALE = 0.55
 
 function ENT:Initialize()
+	self:SetModelScale(1.6, 0)
 	-- Group 1 = wings
 	self:SetBodygroup(1, 1)
 

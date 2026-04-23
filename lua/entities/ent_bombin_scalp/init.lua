@@ -75,6 +75,7 @@ function ENT:Initialize()
 	end
 
 	self:SetModel("models/sw/fr/missiles/agm/scalp.mdl")
+	self:SetModelScale(1.6, 0)
 	self:PhysicsInit(SOLID_VPHYSICS)
 	self:SetMoveType(MOVETYPE_VPHYSICS)
 	self:SetSolid(SOLID_VPHYSICS)
@@ -380,10 +381,6 @@ function ENT:InitDive(ct)
 	self:Debug("DIVE: committed -- aim offset " .. tostring(self.DiveAimOffset))
 end
 
--- ============================================================
--- DIVE UPDATE
--- ============================================================
-
 function ENT:UpdateDive(ct)
 	if self.DiveExploded then return end
 
@@ -445,10 +442,6 @@ function ENT:UpdateDive(ct)
 	end
 end
 
--- ============================================================
--- EXPLOSION
--- ============================================================
-
 function ENT:DiveExplode(pos)
 	if self.DiveExploded then return end
 	self.DiveExploded = true
@@ -474,10 +467,6 @@ function ENT:DiveExplode(pos)
 	self:Remove()
 end
 
--- ============================================================
--- GROUND FINDER
--- ============================================================
-
 function ENT:FindGround(centerPos)
 	local startPos   = Vector(centerPos.x, centerPos.y, centerPos.z + 64)
 	local endPos     = Vector(centerPos.x, centerPos.y, -16384)
@@ -495,10 +484,6 @@ function ENT:FindGround(centerPos)
 	end
 	return -1
 end
-
--- ============================================================
--- CLEANUP
--- ============================================================
 
 function ENT:OnRemove()
 	if self.EngineLoop then self.EngineLoop:Stop() end
