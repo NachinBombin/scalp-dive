@@ -4,7 +4,6 @@ include("shared.lua")
 
 -- ================================================================
 --  SCALP/Storm Shadow -- SERVER
---  Death tumble system ported from LVS fighterplane base.
 -- ================================================================
 
 local PASS_SOUNDS = {
@@ -17,10 +16,6 @@ local ENGINE_LOOP_SOUND = "^jet/luxor/external.wav"
 ENT.WeaponWindow       = 8
 ENT.DIVE_Speed         = 2200
 ENT.DIVE_TrackInterval = 0.1
-
--- ============================================================
--- DEBUG
--- ============================================================
 
 function ENT:Debug(msg)
 	print("[Bombin SCALP] " .. tostring(msg))
@@ -82,16 +77,11 @@ function ENT:Initialize()
 	self:SetSolid(SOLID_VPHYSICS)
 	self:SetCollisionGroup(COLLISION_GROUP_INTERACTIVE_DEBRIS)
 	self:SetPos(spawnPos)
-
-	-- Group 1 = wings
 	self:SetBodygroup(1, 1)
-
 	self:SetRenderMode(RENDERMODE_NORMAL)
 
 	self:SetNWInt("HP",    self.MaxHP)
 	self:SetNWInt("MaxHP", self.MaxHP)
-
-	-- Death state networking
 	self:SetNWBool("Destroyed", false)
 
 	local tangent  = Vector(-entryOffset.y, entryOffset.x, 0) * self.OrbitDir
@@ -156,81 +146,64 @@ function ENT:Initialize()
 	self.DiveWobbleAmpV   = 130
 	self.DiveWobbleSpeedV = 3.1
 
-	self.DiveSpeedMin       = self.DIVE_Speed * 0.55
-	self.DiveSpeedCurrent   = self.DIVE_Speed * 0.55
-	self.DiveSpeedLerp      = 0.018
+	self.DiveSpeedMin     = self.DIVE_Speed * 0.55
+	self.DiveSpeedCurrent = self.DIVE_Speed * 0.55
+	self.DiveSpeedLerp    = 0.018
 	self.DivePitchTelegraph = 0
 
-	-- ---- Death tumble state ----
-	self.Destroyed          = false
-	self.DestroyedTime      = nil   -- when we were shot down
-	self.TumbleAngVel       = Vector(0,0,0) -- seeded spin at kill moment
-	self.ExplodeTimer       = nil   -- CurTime() deadline for final boom
-	self.ExplodedAlready    = false
+	-- Death tumble state
+	self.Destroyed       = false
+	self.DestroyedTime   = nil
+	self.TumbleAngVel    = Vector(0,0,0)
+	self.ExplodeTimer    = nil
+	self.ExplodedAlready = false
 
 	self:Debug("Spawned at " .. tostring(spawnPos) .. " OrbitDir=" .. self.OrbitDir)
 end
 
 -- ============================================================
--- DEATH STATE HELPERS  (LVS-style)
+-- DEATH STATE
 -- ============================================================
 
 function ENT:IsDestroyed()
 	return self.Destroyed == true
 end
 
---[[
-	SetDestroyed()  --  call once when HP hits 0.
-	While diving, we do NOT immediately kill flight --
-	the dive continues under gravity; we just cut thrust
-	and seed a spin so the missile corkscrews into the ground.
-]]
 function ENT:SetDestroyed()
 	if self.Destroyed then return end
 	self.Destroyed = true
 	self:SetNWBool("Destroyed", true)
-
 	self.DestroyedTime = CurTime()
 
-	-- Seed a chaotic tumble from whatever angular velocity exists,
-	-- plus a random kick so even a freshly-spawned missile spins.
 	if IsValid(self.PhysObj) then
 		local existing = self.PhysObj:GetAngleVelocity()
 		self.TumbleAngVel = existing + Vector(
-			math.Rand(-80, 80),
-			math.Rand(-80, 80),
-			math.Rand(-80, 80)
+			math.Rand(-120, 120),
+			math.Rand(-120, 120),
+			math.Rand(-120, 120)
 		)
-		-- Re-enable gravity now that thrust is dead
 		self.PhysObj:EnableGravity(true)
+		-- Kick the angular velocity immediately so tumble is visible right away
+		self.PhysObj:AddAngleVelocity(self.TumbleAngVel)
 	end
 
-	-- Ramp engine audio down to silence
 	if self.EngineLoop then
-		self.EngineLoop:ChangeVolume(0, 1.2)
-		self.EngineLoop:ChangePitch(60, 2.0)
+		self.EngineLoop:ChangeVolume(0, 1.5)
+		self.EngineLoop:ChangePitch(55, 2.5)
 	end
 
-	-- Time-to-boom: LVS formula -- faster == more tumble time (1.5 – 16 s)
-	local speed = self:GetVelocity():Length()
-	local delay = math.Clamp((speed - 200) / 200, 1.5, 16)
+	-- Timer-only: minimum 3s, maximum 12s based on altitude above ground.
+	-- We do NOT use velocity -- orbit speed (~250 u/s) is too low and
+	-- would instant-trigger any reasonable velocity threshold.
+	local altAboveGround = self:GetPos().z - (self.sky - self.SkyHeightAdd)
+	local delay = math.Clamp(altAboveGround / 600, 3, 12)
 	self.ExplodeTimer = CurTime() + delay
 
-	-- Detach from dive targeting so we fall freely
-	-- (unless we are mid-dive, in which case we let the dive
-	--  continue under tumble physics and explode on ground hit)
 	if not self.Diving then
 		self.CurrentWeapon = nil
 	end
 
-	-- Spawn fire-trail effect at the missile body (broadcast to all clients)
-	local effectdata = EffectData()
-	effectdata:SetOrigin(self:GetPos())
-	effectdata:SetEntity(self)
-	effectdata:SetMagnitude(delay)
-	util.Effect("lvs_firetrail", effectdata, true, true)
-
-	self:Debug("DESTROYED -- tumble seed=" .. tostring(self.TumbleAngVel) .. " boom in " .. math.Round(delay,1) .. "s")
+	self:Debug("DESTROYED -- tumble kick=" .. tostring(self.TumbleAngVel) .. " boom in " .. math.Round(delay,1) .. "s")
 end
 
 -- ============================================================
@@ -271,23 +244,14 @@ function ENT:Think()
 		self.PhysObj:Wake()
 	end
 
-	-- ---- Death tumble think (LVS-style) ----
+	-- Destroyed: only the timer and the ground-trace in PhysicsUpdate
+	-- trigger the final explosion. Nothing velocity-based here.
 	if self:IsDestroyed() then
-		local vel = self:GetVelocity():Length()
-
-		-- Explode immediately if we've slowed below 800 u/s (hit ground / lost momentum)
-		if vel < 800 then
-			self:CrashExplode(self:GetPos())
-			return true
-		end
-
-		-- Or if the countdown timer has expired
 		if self.ExplodeTimer and ct >= self.ExplodeTimer then
 			self:CrashExplode(self:GetPos())
 			return true
 		end
-
-		self:NextThink(ct)
+		self:NextThink(ct + 0.05)
 		return true
 	end
 
@@ -310,51 +274,44 @@ function ENT:Think()
 end
 
 -- ============================================================
--- ORBIT FLIGHT  (normal, non-destroyed)
+-- PHYSICS UPDATE
 -- ============================================================
 
 function ENT:PhysicsUpdate(phys)
 	if not self.DieTime or not self.sky then return end
 	if CurTime() >= self.DieTime then self:Remove() return end
 
-	-- ---- Destroyed: tumble physics ----
+	-- ---- Destroyed: tumble + ground check ----
 	if self:IsDestroyed() then
 		local dt = FrameTime()
 		if dt <= 0 then dt = 0.01 end
 
-		--[[
-			LVS trick: feed current angular velocity back as
-			"steering" so the spin self-reinforces (chaos grows).
-			Divide by 200 to keep it in a sane torque range.
-		]]
-		local angVel     = phys:GetAngleVelocity()
-		local tumbleTorque = angVel / 200
+		-- Self-reinforcing spin (LVS style)
+		local angVel = phys:GetAngleVelocity()
+		phys:AddAngleVelocity((angVel * 0.12) - (angVel * dt * 0.5))
 
-		-- Apply tumble torque -- amplify the existing spin each frame
-		local torqueForce = tumbleTorque * 25 * dt * 250
-		-- Damp slightly so it doesn't go fully infinite
-		local damping     = angVel * 0.8 * dt
-		phys:AddAngleVelocity(torqueForce - damping)
-
-		-- Gravity is now real (enabled in SetDestroyed).
-		-- During dive: continue pushing the missile toward target
-		-- but with reduced force -- gravity + dive momentum carry it.
-		if self.Diving and self.DiveTargetPos then
-			local pos = self:GetPos()
-			local dir = (self.DiveTargetPos - pos):GetNormalized()
-			-- Half normal dive thrust so it arcs rather than tracking precisely
-			local cripplePush = dir * (self.DiveSpeedCurrent * 0.5)
-			phys:SetVelocity(phys:GetVelocity() * 0.95 + cripplePush * dt)
-		else
-			-- Not diving: let gravity pull it down, just bleed XY velocity
+		-- Gravity handles Z; just bleed XY so it arcs rather than tracking
+		if not (self.Diving and self.DiveTargetPos) then
 			local vel = phys:GetVelocity()
-			phys:SetVelocity(Vector(vel.x * 0.98, vel.y * 0.98, vel.z)) -- no horizontal thrust
+			phys:SetVelocity(Vector(vel.x * 0.985, vel.y * 0.985, vel.z))
 		end
 
+		-- Ground-hit detection via short downward trace
+		local pos     = self:GetPos()
+		local nextPos = pos + phys:GetVelocity() * dt
+		local tr = util.TraceLine({
+			start  = pos,
+			endpos = nextPos + Vector(0, 0, -32), -- extend slightly down
+			filter = self,
+			mask   = MASK_SOLID_BRUSHONLY,
+		})
+		if tr.Hit then
+			self:CrashExplode(tr.HitPos)
+		end
 		return
 	end
 
-	-- ---- Normal orbit physics ----
+	-- ---- Normal orbit ----
 	if self.Diving then return end
 
 	local pos = self:GetPos()
@@ -516,23 +473,13 @@ end
 function ENT:UpdateDive(ct)
 	if self.DiveExploded then return end
 
-	--[[
-		If shot down MID-DIVE, we do NOT abort.
-		The destroyed flag makes PhysicsUpdate switch to tumble,
-		but we still track the last known target position and
-		let gravity + crippled push carry the missile to impact.
-		The trace-hit below will then call CrashExplode.
-	]]
-
 	if ct >= self.DiveNextTrack then
-		-- Only update target position if we are NOT destroyed
-		-- (destroyed: track frozen at last known pos)
 		if not self:IsDestroyed() then
 			if IsValid(self.DiveTarget) and self.DiveTarget:Alive() then
 				self.DiveTargetPos = self.DiveTarget:GetPos() + Vector(
 					math.Rand(-120,120), math.Rand(-120,120), 0)
-				end
 			end
+		end
 		self.DiveNextTrack = ct + self.DIVE_TrackInterval
 	end
 
@@ -543,28 +490,20 @@ function ENT:UpdateDive(ct)
 	local dist  = dir:Length()
 
 	if dist < 120 then
-		-- Reached target: normal dive explosion (full damage)
-		self:DiveExplode(myPos)
+		-- Only full-damage explode if NOT destroyed mid-dive
+		if self:IsDestroyed() then
+			self:CrashExplode(myPos)
+		else
+			self:DiveExplode(myPos)
+		end
 		return
 	end
 	dir:Normalize()
 
-	-- If destroyed, PhysicsUpdate handles velocity; we only do the trace here
-	if self:IsDestroyed() then
-		local nextPos = myPos + self:GetVelocity() * FrameTime()
-		local tr = util.TraceLine({
-			start  = myPos,
-			endpos = nextPos,
-			filter = self,
-			mask   = MASK_SOLID,
-		})
-		if tr.Hit then
-			self:CrashExplode(tr.HitPos)
-		end
-		return
-	end
+	-- Destroyed mid-dive: PhysicsUpdate drives velocity; skip self-propulsion
+	if self:IsDestroyed() then return end
 
-	-- Normal dive: self-propelled
+	-- Normal self-propelled dive
 	self.DiveSpeedCurrent = Lerp(self.DiveSpeedLerp, self.DiveSpeedCurrent, self.DIVE_Speed)
 
 	local dt = FrameTime()
@@ -607,13 +546,12 @@ function ENT:UpdateDive(ct)
 end
 
 -- ============================================================
--- EXPLOSION VARIANTS
+-- EXPLOSIONS
 -- ============================================================
 
---[[ Normal dive -- full warhead damage ]]
 function ENT:DiveExplode(pos)
 	if self.DiveExploded then return end
-	self.DiveExploded   = true
+	self.DiveExploded    = true
 	self.ExplodedAlready = true
 	self:Debug("DIVE: exploding at " .. tostring(pos))
 
@@ -629,7 +567,7 @@ function ENT:DiveExplode(pos)
 	E("500lb_air",          pos + Vector(0,0,160), 5)
 	E("HelicopterMegaBomb", pos + Vector(0,0,20),  6)
 
-	sound.Play("weapon_AWP.Single",               pos,                155, 52, 1.0)
+	sound.Play("weapon_AWP.Single",                pos,                155, 52, 1.0)
 	sound.Play("ambient/explosions/explode_8.wav", pos,                150, 78, 1.0)
 	sound.Play("ambient/explosions/explode_8.wav", pos+Vector(0,0,40), 145, 85, 0.9)
 
@@ -637,7 +575,6 @@ function ENT:DiveExplode(pos)
 	self:Remove()
 end
 
---[[ Shot-down crash -- reduced damage, smaller boom ]]
 function ENT:CrashExplode(pos)
 	if self.ExplodedAlready then return end
 	self.ExplodedAlready = true
@@ -649,7 +586,6 @@ function ENT:CrashExplode(pos)
 		ed:SetScale(sc) ed:SetMagnitude(sc) ed:SetRadius(sc * 100)
 		util.Effect(effect, ed, true, true)
 	end
-	-- Smaller boom than a successful dive strike
 	E("HelicopterMegaBomb", pos,                  5)
 	E("500lb_air",          pos,                  4)
 	E("500lb_air",          pos + Vector(0,0,60), 3)
@@ -657,7 +593,6 @@ function ENT:CrashExplode(pos)
 	sound.Play("ambient/explosions/explode_8.wav", pos, 145, 72, 1.0)
 	sound.Play("ambient/explosions/explode_8.wav", pos, 140, 88, 0.8)
 
-	-- 30 % of normal warhead damage (munition was destroyed mid-flight)
 	local crashDmg = self.DIVE_ExplosionDamage * 0.3
 	local crashRad = self.DIVE_ExplosionRadius * 0.6
 	util.BlastDamage(self, self, pos, crashRad, crashDmg)
