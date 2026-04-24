@@ -13,8 +13,8 @@ local PASS_SOUNDS = {
 
 local ENGINE_LOOP_SOUND = "^jet/luxor/external.wav"
 local SHARD_MODEL       = "models/props_c17/FurnitureDrawer001a_Shard01.mdl"
-local GRAVITY_MULT      = 3.8   -- how much harder than normal gravity during tumble
-local SHARD_LIFE        = 8     -- seconds before debris auto-removes
+local GRAVITY_MULT      = 2.2   -- extra gravity multiplier (additive on top of real gravity)
+local SHARD_LIFE        = 8
 
 ENT.WeaponWindow       = 8
 ENT.DIVE_Speed         = 2200
@@ -173,8 +173,8 @@ function ENT:IsDestroyed()
 end
 
 function ENT:SpawnDebrisShards()
-	local count = math.random(1, 2)
-	local origin = self:GetPos()
+	local count   = math.random(1, 2)
+	local origin  = self:GetPos()
 	local baseVel = self:GetVelocity()
 
 	for i = 1, count do
@@ -186,15 +186,12 @@ function ENT:SpawnDebrisShards()
 		shard:SetAngles(Angle(math.Rand(0,360), math.Rand(0,360), math.Rand(0,360)))
 		shard:Spawn()
 		shard:Activate()
-
-		-- Paint black
 		shard:SetColor(Color(15, 10, 10, 255))
 		shard:SetMaterial("models/debug/debugwhite")
 
 		local phys = shard:GetPhysicsObject()
 		if IsValid(phys) then
 			phys:Wake()
-			-- Inherit missile velocity plus a random outward kick
 			local kick = Vector(
 				math.Rand(-300, 300),
 				math.Rand(-300, 300),
@@ -208,10 +205,7 @@ function ENT:SpawnDebrisShards()
 			))
 		end
 
-		-- Ignite
 		shard:Ignite(SHARD_LIFE, 0)
-
-		-- Auto-remove
 		timer.Simple(SHARD_LIFE, function()
 			if IsValid(shard) then shard:Remove() end
 		end)
@@ -231,14 +225,12 @@ function ENT:SetDestroyed()
 			math.Rand(-120, 120),
 			math.Rand(-120, 120)
 		)
-		self.PhysObj:EnableGravity(false) -- we apply manual gravity in PhysicsUpdate
+		-- Re-enable real gravity; PhysicsUpdate adds only the EXTRA delta on top
+		self.PhysObj:EnableGravity(true)
 		self.PhysObj:AddAngleVelocity(self.TumbleAngVel)
 	end
 
-	-- Real fire on the missile body
 	self:Ignite(20, 0)
-
-	-- Spawn burning debris
 	self:SpawnDebrisShards()
 
 	if self.EngineLoop then
@@ -254,7 +246,7 @@ function ENT:SetDestroyed()
 		self.CurrentWeapon = nil
 	end
 
-	self:Debug("DESTROYED -- tumble kick=" .. tostring(self.TumbleAngVel) .. " boom in " .. math.Round(delay,1) .. "s")
+	self:Debug("DESTROYED -- boom in " .. math.Round(delay,1) .. "s")
 end
 
 -- ============================================================
@@ -330,34 +322,32 @@ function ENT:PhysicsUpdate(phys)
 	if not self.DieTime or not self.sky then return end
 	if CurTime() >= self.DieTime then self:Remove() return end
 
-	-- ---- Destroyed: tumble + boosted gravity + ground trace ----
+	-- ---- Destroyed: tumble ----
 	if self:IsDestroyed() then
 		local dt = FrameTime()
 		if dt <= 0 then dt = 0.01 end
 
-		-- Self-reinforcing spin
+		-- Self-reinforcing spin -- amplify whatever is already spinning
 		local angVel = phys:GetAngleVelocity()
-		phys:AddAngleVelocity((angVel * 0.12) - (angVel * dt * 0.5))
+		phys:AddAngleVelocity(angVel * 0.08 * dt * 60)
 
-		-- Manual gravity multiplier -- much punchier fall
-		-- GetGravity() returns the world gravity scalar (default 600 u/s^2)
-		local grav = physenv.GetGravity() or Vector(0, 0, -600)
-		local gravZ = (isvector(grav) and grav.z or -600)
-		phys:ApplyForceCenter(Vector(0, 0, gravZ * (GRAVITY_MULT - 1) * phys:GetMass()))
-
-		-- Bleed horizontal velocity so it doesn't orbit sideways forever
-		if not (self.Diving and self.DiveTargetPos) then
-			local vel = phys:GetVelocity()
-			phys:SetVelocity(Vector(vel.x * 0.985, vel.y * 0.985, vel.z))
-		end
+		--[[
+			Momentum conservation: do NOT touch SetVelocity or bleed XY.
+			Real gravity is already on (EnableGravity(true) in SetDestroyed).
+			We only push the EXTRA delta force so the fall is punchier
+			without stripping the horizontal arc the missile had at kill time.
+		]]
+		local gravZ = -600 -- GMod default gravity in u/s^2
+		local extraG = gravZ * (GRAVITY_MULT - 1) * phys:GetMass()
+		phys:ApplyForceCenter(Vector(0, 0, extraG))
 
 		-- Ground-hit detection
-		local pos     = self:GetPos()
-		local vel2    = phys:GetVelocity()
-		local nextPos = pos + vel2 * dt
+		local pos  = self:GetPos()
+		local vel  = phys:GetVelocity()
+		local next = pos + vel * dt + Vector(0, 0, -24)
 		local tr = util.TraceLine({
 			start  = pos,
-			endpos = nextPos + Vector(0, 0, -32),
+			endpos = next,
 			filter = self,
 			mask   = MASK_SOLID_BRUSHONLY,
 		})
