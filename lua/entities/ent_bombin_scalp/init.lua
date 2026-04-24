@@ -13,7 +13,7 @@ local PASS_SOUNDS = {
 
 local ENGINE_LOOP_SOUND = "^jet/luxor/external.wav"
 local SHARD_MODEL       = "models/props_c17/FurnitureDrawer001a_Shard01.mdl"
-local GRAVITY_MULT      = 2.2   -- extra gravity multiplier (additive on top of real gravity)
+local GRAVITY_MULT      = 1.5   -- extra gravity multiplier (additive on top of real gravity)
 local SHARD_LIFE        = 8
 
 ENT.WeaponWindow       = 8
