@@ -12,6 +12,9 @@ local PASS_SOUNDS = {
 }
 
 local ENGINE_LOOP_SOUND = "^jet/luxor/external.wav"
+local SHARD_MODEL       = "models/props_c17/FurnitureDrawer001a_Shard01.mdl"
+local GRAVITY_MULT      = 3.8   -- how much harder than normal gravity during tumble
+local SHARD_LIFE        = 8     -- seconds before debris auto-removes
 
 ENT.WeaponWindow       = 8
 ENT.DIVE_Speed         = 2200
@@ -169,6 +172,52 @@ function ENT:IsDestroyed()
 	return self.Destroyed == true
 end
 
+function ENT:SpawnDebrisShards()
+	local count = math.random(1, 2)
+	local origin = self:GetPos()
+	local baseVel = self:GetVelocity()
+
+	for i = 1, count do
+		local shard = ents.Create("prop_physics")
+		if not IsValid(shard) then continue end
+
+		shard:SetModel(SHARD_MODEL)
+		shard:SetPos(origin + Vector(math.Rand(-30,30), math.Rand(-30,30), math.Rand(-20,20)))
+		shard:SetAngles(Angle(math.Rand(0,360), math.Rand(0,360), math.Rand(0,360)))
+		shard:Spawn()
+		shard:Activate()
+
+		-- Paint black
+		shard:SetColor(Color(15, 10, 10, 255))
+		shard:SetMaterial("models/debug/debugwhite")
+
+		local phys = shard:GetPhysicsObject()
+		if IsValid(phys) then
+			phys:Wake()
+			-- Inherit missile velocity plus a random outward kick
+			local kick = Vector(
+				math.Rand(-300, 300),
+				math.Rand(-300, 300),
+				math.Rand(50,  250)
+			)
+			phys:SetVelocity(baseVel * 0.3 + kick)
+			phys:AddAngleVelocity(Vector(
+				math.Rand(-200, 200),
+				math.Rand(-200, 200),
+				math.Rand(-200, 200)
+			))
+		end
+
+		-- Ignite
+		shard:Ignite(SHARD_LIFE, 0)
+
+		-- Auto-remove
+		timer.Simple(SHARD_LIFE, function()
+			if IsValid(shard) then shard:Remove() end
+		end)
+	end
+end
+
 function ENT:SetDestroyed()
 	if self.Destroyed then return end
 	self.Destroyed = true
@@ -182,19 +231,21 @@ function ENT:SetDestroyed()
 			math.Rand(-120, 120),
 			math.Rand(-120, 120)
 		)
-		self.PhysObj:EnableGravity(true)
-		-- Kick the angular velocity immediately so tumble is visible right away
+		self.PhysObj:EnableGravity(false) -- we apply manual gravity in PhysicsUpdate
 		self.PhysObj:AddAngleVelocity(self.TumbleAngVel)
 	end
+
+	-- Real fire on the missile body
+	self:Ignite(20, 0)
+
+	-- Spawn burning debris
+	self:SpawnDebrisShards()
 
 	if self.EngineLoop then
 		self.EngineLoop:ChangeVolume(0, 1.5)
 		self.EngineLoop:ChangePitch(55, 2.5)
 	end
 
-	-- Timer-only: minimum 3s, maximum 12s based on altitude above ground.
-	-- We do NOT use velocity -- orbit speed (~250 u/s) is too low and
-	-- would instant-trigger any reasonable velocity threshold.
 	local altAboveGround = self:GetPos().z - (self.sky - self.SkyHeightAdd)
 	local delay = math.Clamp(altAboveGround / 600, 3, 12)
 	self.ExplodeTimer = CurTime() + delay
@@ -244,8 +295,6 @@ function ENT:Think()
 		self.PhysObj:Wake()
 	end
 
-	-- Destroyed: only the timer and the ground-trace in PhysicsUpdate
-	-- trigger the final explosion. Nothing velocity-based here.
 	if self:IsDestroyed() then
 		if self.ExplodeTimer and ct >= self.ExplodeTimer then
 			self:CrashExplode(self:GetPos())
@@ -281,27 +330,34 @@ function ENT:PhysicsUpdate(phys)
 	if not self.DieTime or not self.sky then return end
 	if CurTime() >= self.DieTime then self:Remove() return end
 
-	-- ---- Destroyed: tumble + ground check ----
+	-- ---- Destroyed: tumble + boosted gravity + ground trace ----
 	if self:IsDestroyed() then
 		local dt = FrameTime()
 		if dt <= 0 then dt = 0.01 end
 
-		-- Self-reinforcing spin (LVS style)
+		-- Self-reinforcing spin
 		local angVel = phys:GetAngleVelocity()
 		phys:AddAngleVelocity((angVel * 0.12) - (angVel * dt * 0.5))
 
-		-- Gravity handles Z; just bleed XY so it arcs rather than tracking
+		-- Manual gravity multiplier -- much punchier fall
+		-- GetGravity() returns the world gravity scalar (default 600 u/s^2)
+		local grav = physenv.GetGravity() or Vector(0, 0, -600)
+		local gravZ = (isvector(grav) and grav.z or -600)
+		phys:ApplyForceCenter(Vector(0, 0, gravZ * (GRAVITY_MULT - 1) * phys:GetMass()))
+
+		-- Bleed horizontal velocity so it doesn't orbit sideways forever
 		if not (self.Diving and self.DiveTargetPos) then
 			local vel = phys:GetVelocity()
 			phys:SetVelocity(Vector(vel.x * 0.985, vel.y * 0.985, vel.z))
 		end
 
-		-- Ground-hit detection via short downward trace
+		-- Ground-hit detection
 		local pos     = self:GetPos()
-		local nextPos = pos + phys:GetVelocity() * dt
+		local vel2    = phys:GetVelocity()
+		local nextPos = pos + vel2 * dt
 		local tr = util.TraceLine({
 			start  = pos,
-			endpos = nextPos + Vector(0, 0, -32), -- extend slightly down
+			endpos = nextPos + Vector(0, 0, -32),
 			filter = self,
 			mask   = MASK_SOLID_BRUSHONLY,
 		})
@@ -423,7 +479,7 @@ function ENT:PickNewWeapon(ct)
 end
 
 -- ============================================================
--- DIVE INIT
+-- DIVE
 -- ============================================================
 
 function ENT:InitDive(ct)
@@ -490,7 +546,6 @@ function ENT:UpdateDive(ct)
 	local dist  = dir:Length()
 
 	if dist < 120 then
-		-- Only full-damage explode if NOT destroyed mid-dive
 		if self:IsDestroyed() then
 			self:CrashExplode(myPos)
 		else
@@ -500,10 +555,8 @@ function ENT:UpdateDive(ct)
 	end
 	dir:Normalize()
 
-	-- Destroyed mid-dive: PhysicsUpdate drives velocity; skip self-propulsion
 	if self:IsDestroyed() then return end
 
-	-- Normal self-propelled dive
 	self.DiveSpeedCurrent = Lerp(self.DiveSpeedLerp, self.DiveSpeedCurrent, self.DIVE_Speed)
 
 	local dt = FrameTime()
