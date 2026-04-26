@@ -13,15 +13,36 @@ local PASS_SOUNDS = {
 
 local ENGINE_LOOP_SOUND = "^jet/luxor/external.wav"
 local SHARD_MODEL       = "models/props_c17/FurnitureDrawer001a_Shard01.mdl"
-local GRAVITY_MULT      = 1.5   -- extra gravity multiplier (additive on top of real gravity)
+local GRAVITY_MULT      = 1.5
 local SHARD_LIFE        = 8
 
 ENT.WeaponWindow       = 8
 ENT.DIVE_Speed         = 2200
 ENT.DIVE_TrackInterval = 0.1
 
+util.AddNetworkString("bombin_scalp_damage_tier")
+
 function ENT:Debug(msg)
 	print("[Bombin SCALP] " .. tostring(msg))
+end
+
+-- ============================================================
+-- TIER HELPERS
+-- ============================================================
+
+local function CalcTier(hp, maxHP)
+	local frac = hp / maxHP
+	if frac > 0.66 then return 0 end
+	if frac > 0.33 then return 1 end
+	if hp   > 0    then return 2 end
+	return 3
+end
+
+local function BroadcastTier(ent, tier)
+	net.Start("bombin_scalp_damage_tier")
+		net.WriteUInt(ent:EntIndex(), 16)
+		net.WriteUInt(tier, 2)
+	net.Broadcast()
 end
 
 -- ============================================================
@@ -161,6 +182,9 @@ function ENT:Initialize()
 	self.ExplodeTimer    = nil
 	self.ExplodedAlready = false
 
+	-- Damage tier (0=healthy, 1=light, 2=heavy, 3=dead)
+	self.DamageTier = 0
+
 	self:Debug("Spawned at " .. tostring(spawnPos) .. " OrbitDir=" .. self.OrbitDir)
 end
 
@@ -218,6 +242,8 @@ function ENT:SetDestroyed()
 	self:SetNWBool("Destroyed", true)
 	self.DestroyedTime = CurTime()
 
+	BroadcastTier(self, 3)
+
 	if IsValid(self.PhysObj) then
 		local existing = self.PhysObj:GetAngleVelocity()
 		self.TumbleAngVel = existing + Vector(
@@ -225,7 +251,6 @@ function ENT:SetDestroyed()
 			math.Rand(-120, 120),
 			math.Rand(-120, 120)
 		)
-		-- Re-enable real gravity; PhysicsUpdate adds only the EXTRA delta on top
 		self.PhysObj:EnableGravity(true)
 		self.PhysObj:AddAngleVelocity(self.TumbleAngVel)
 	end
@@ -260,6 +285,12 @@ function ENT:OnTakeDamage(dmginfo)
 	local hp = self:GetNWInt("HP", self.MaxHP or 200)
 	hp = hp - dmginfo:GetDamage()
 	self:SetNWInt("HP", hp)
+
+	local newTier = CalcTier(math.max(hp, 0), self.MaxHP)
+	if newTier ~= self.DamageTier then
+		self.DamageTier = newTier
+		BroadcastTier(self, newTier)
+	end
 
 	if hp <= 0 and not self:IsDestroyed() then
 		self:Debug("Shot down!")
@@ -327,21 +358,13 @@ function ENT:PhysicsUpdate(phys)
 		local dt = FrameTime()
 		if dt <= 0 then dt = 0.01 end
 
-		-- Self-reinforcing spin -- amplify whatever is already spinning
 		local angVel = phys:GetAngleVelocity()
 		phys:AddAngleVelocity(angVel * 0.08 * dt * 60)
 
-		--[[
-			Momentum conservation: do NOT touch SetVelocity or bleed XY.
-			Real gravity is already on (EnableGravity(true) in SetDestroyed).
-			We only push the EXTRA delta force so the fall is punchier
-			without stripping the horizontal arc the missile had at kill time.
-		]]
-		local gravZ = -600 -- GMod default gravity in u/s^2
+		local gravZ  = -600
 		local extraG = gravZ * (GRAVITY_MULT - 1) * phys:GetMass()
 		phys:ApplyForceCenter(Vector(0, 0, extraG))
 
-		-- Ground-hit detection
 		local pos  = self:GetPos()
 		local vel  = phys:GetVelocity()
 		local next = pos + vel * dt + Vector(0, 0, -24)
