@@ -137,13 +137,14 @@ function ENT:Initialize()
 	self.WanderRateX   = math.Rand(0.004, 0.010)
 	self.WanderRateY   = math.Rand(0.003, 0.009)
 
-	-- Sky / obstacle evasion probes (ported from AN-71)
-	self.SkyYawBias      = 0
+	-- Sky / obstacle evasion probes
+	-- Biases are in RADIANS PER SECOND -- scaled by dt in PhysicsUpdate
+	self.SkyYawBias      = 0   -- rad/s additive to OrbitAngSpeed
 	self.SkyProbeDist    = math.max(1200, self.Speed * 6)
 	self.SkyProbeLastHit = 0
 	self.ObsLastEval     = 0
-	self.ObsYawBias      = 0
-	self.ObsAltBias      = 0
+	self.ObsYawBias      = 0   -- rad/s additive to OrbitAngSpeed
+	self.ObsAltBias      = 0   -- HU additive to liveAlt
 	self.ObsConsecHits   = 0
 
 	self.PhysObj = self:GetPhysicsObject()
@@ -355,7 +356,14 @@ function ENT:Think()
 end
 
 -- ============================================================
--- SKY PROBE EVASION  (AN-71 system)
+-- SKY PROBE EVASION
+-- ============================================================
+-- FIX: biases are now rad/s (not raw radians-per-tick).
+-- FIX: biasSide sign corrected -- probe on the RIGHT side hitting sky
+--      means steer LEFT (negative yaw when OrbitDir=1), so yawOff>0 => biasSide-=1
+--      was already doing that, but the final sign on SkyYawBias was INVERTED.
+--      Old:  (biasSide >= 0 and 1 or -1)  -- points TOWARD the wall
+--      New:  (biasSide >= 0 and -1 or 1)  -- points AWAY from the wall
 -- ============================================================
 
 function ENT:EvaluateSkyProbes(forward, pos)
@@ -378,6 +386,8 @@ function ENT:EvaluateSkyProbes(forward, pos)
 
 		if trSky.Hit and trSky.HitSky then
 			hitCount = hitCount + 1
+			-- probe right of nose hit sky -> steer left: biasSide--
+			-- probe left  of nose hit sky -> steer right: biasSide++
 			if yawOff >= 0 then
 				biasSide = biasSide - 1
 			else
@@ -391,7 +401,10 @@ function ENT:EvaluateSkyProbes(forward, pos)
 
 	if hitCount > 0 then
 		local urgency = (CurTime() - self.SkyProbeLastHit < 0.5) and 2.0 or 1.0
-		self.SkyYawBias = (biasSide >= 0 and 1 or -1) * 0.25 * urgency * self.OrbitDir
+		-- biasSide<0 means more right probes hit => steer left => negative rad/s
+		-- biasSide>0 means more left  probes hit => steer right => positive rad/s
+		-- Magnitude: ~0.4 rad/s base, enough to noticeably bend the arc
+		self.SkyYawBias = biasSide * 0.08 * urgency
 	else
 		self.SkyYawBias = self.SkyYawBias * 0.85
 		if math.abs(self.SkyYawBias) < 0.001 then self.SkyYawBias = 0 end
@@ -399,7 +412,11 @@ function ENT:EvaluateSkyProbes(forward, pos)
 end
 
 -- ============================================================
--- OBSTACLE PROBE EVASION  (AN-71 system)
+-- OBSTACLE PROBE EVASION
+-- ============================================================
+-- FIX: ObsYawBias now in rad/s, consistent with OrbitAngSpeed units.
+--      Old values (0.3 raw) were per-tick which is ~18 deg/tick -- violent.
+--      New values (~0.25 rad/s) are gentle and frame-rate independent.
 -- ============================================================
 
 function ENT:EvaluateObstacleProbes(forward, pos)
@@ -452,12 +469,13 @@ function ENT:EvaluateObstacleProbes(forward, pos)
 
 	if totalHits > 0 then
 		local urgencyScale = (self.ObsConsecHits >= 2) and 2.0 or 1.0
+		-- rad/s bias: ~0.25 base, doubled under urgency
 		if hitRight > hitLeft then
-			self.ObsYawBias = -0.3 * urgencyScale
+			self.ObsYawBias = -0.25 * urgencyScale  -- obstacle right -> steer left
 		elseif hitLeft > hitRight then
-			self.ObsYawBias = 0.3 * urgencyScale
+			self.ObsYawBias =  0.25 * urgencyScale  -- obstacle left  -> steer right
 		else
-			self.ObsYawBias = self.OrbitDir * 0.3 * urgencyScale
+			self.ObsYawBias = self.OrbitDir * 0.25 * urgencyScale  -- symmetric -> follow orbit dir
 		end
 		if hitFront > 1.5 then
 			self.ObsAltBias = math.Rand(120, 260)
@@ -521,15 +539,15 @@ function ENT:PhysicsUpdate(phys)
 		self.BaseCenterPos.z
 	)
 
-	-- Evasion probes
+	-- Evasion probes (biases are rad/s; multiplied by dt below)
 	self:EvaluateSkyProbes(forward, pos)
 	self:EvaluateObstacleProbes(forward, pos)
 
-	-- Orbit advance with evasion biases
-	self.OrbitAngSpeed = (self.Speed / self.OrbitRadius) * self.OrbitDir
-	                   + self.SkyYawBias
-	                   + self.ObsYawBias
-	self.OrbitAngle    = self.OrbitAngle + self.OrbitAngSpeed * dt
+	-- FIX: OrbitAngSpeed is the BASE rate only.
+	--      Biases (rad/s) are added separately and scaled by dt so they
+	--      are frame-rate independent and don't fight yawCorrection.
+	local baseAngSpeed = (self.Speed / self.OrbitRadius) * self.OrbitDir
+	self.OrbitAngle = self.OrbitAngle + (baseAngSpeed + self.SkyYawBias + self.ObsYawBias) * dt
 
 	local desiredX = self.CenterPos.x + math.cos(self.OrbitAngle) * self.OrbitRadius
 	local desiredY = self.CenterPos.y + math.sin(self.OrbitAngle) * self.OrbitRadius
@@ -578,9 +596,17 @@ function ENT:PhysicsUpdate(phys)
 		phys:SetVelocity(vel)
 	end
 
-	if not self:IsInWorld() then
-		self:Debug("Out of world -- recentering")
-		self:SetPos(Vector(self.CenterPos.x, self.CenterPos.y, self.sky))
+	-- FIX: world-boundary check is now a FORWARD LOOKAHEAD trace (600 HU ahead)
+	--      instead of checking IsInWorld() after the missile already left.
+	--      This catches the problem one tick before the despawn, giving time to recenter.
+	local lookAhead = pos + forward * 600
+	if not util.IsInWorld(lookAhead) or not util.IsInWorld(pos) then
+		self:Debug("Near world boundary -- recentering")
+		local safePos = Vector(self.CenterPos.x, self.CenterPos.y, self.sky)
+		if util.IsInWorld(safePos) then
+			self:SetPos(safePos)
+			if IsValid(phys) then phys:SetPos(safePos) end
+		end
 		self.OrbitAngle = math.atan2(
 			self:GetPos().y - self.CenterPos.y,
 			self:GetPos().x - self.CenterPos.x
