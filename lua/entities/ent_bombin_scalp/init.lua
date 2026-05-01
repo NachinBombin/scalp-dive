@@ -78,13 +78,22 @@ function ENT:Initialize()
 	self.OrbitRadius = baseRadius * math.Rand(0.82, 1.18)
 	self.Speed       = baseSpeed  * math.Rand(0.85, 1.15)
 
-	self.OrbitDir      = (math.random(0, 1) == 0) and 1 or -1
-	self.OrbitAngle    = math.Rand(0, math.pi * 2)
-	self.OrbitAngSpeed = (self.Speed / self.OrbitRadius) * self.OrbitDir
+	-- AN-71-style orbit parameters
+	self.OrbitDirection = (math.random(2) == 1) and 1 or -1
+	self.OrbitBlend     = 0.08
+	self.RadialGain     = 0.42
+	self.WallAvoidGain  = 1.8
+	self.MaxTurnRate    = 38     -- deg/s; missiles turn tighter than big planes
 
-	local entryRad    = self.OrbitAngle
-	local entryOffset = Vector(math.cos(entryRad), math.sin(entryRad), 0)
-	local spawnPos    = self.CenterPos + entryOffset * (self.OrbitRadius * 1.05)
+	-- Compute entry tangent aligned to CallDir
+	local right   = Vector(-self.CallDir.y, self.CallDir.x, 0)
+	local tangent = self.CallDir + right * 0
+	tangent.z = 0
+	tangent:Normalize()
+	self.OrbitTangent = tangent * self.OrbitDirection
+
+	local spawnOffset = self.OrbitTangent * (-self.OrbitRadius * math.Rand(0.55, 0.95))
+	local spawnPos    = self.CenterPos + spawnOffset
 	spawnPos.z        = self.sky
 
 	if not util.IsInWorld(spawnPos) then
@@ -108,14 +117,13 @@ function ENT:Initialize()
 	self:SetNWInt("MaxHP", self.MaxHP)
 	self:SetNWBool("Destroyed", false)
 
-	local tangent  = Vector(-entryOffset.y, entryOffset.x, 0) * self.OrbitDir
-	local startAng = tangent:Angle()
-	self:SetAngles(Angle(0, startAng.y, 0))
-	self.ang = self:GetAngles()
+	-- flightYaw: true direction of travel, same role as in AN-71
+	self.flightYaw = self.OrbitTangent:Angle().y
+	self.PrevYaw   = self.flightYaw
+	self.ang       = Angle(0, self.flightYaw, 0)
 
 	self.SmoothedRoll  = 0
 	self.SmoothedPitch = 0
-	self.PrevYaw       = self:GetAngles().y
 
 	self.JitterPhase  = math.Rand(0, math.pi * 2)
 	self.JitterPhase2 = math.Rand(0, math.pi * 2)
@@ -137,17 +145,11 @@ function ENT:Initialize()
 	self.WanderRateX   = math.Rand(0.004, 0.010)
 	self.WanderRateY   = math.Rand(0.003, 0.009)
 
-	-- Sky / obstacle evasion probes (biases in rad/s)
-	self.SkyYawBias      = 0
-	self.SkyProbeDist    = math.max(1200, self.Speed * 6)
-	self.SkyProbeLastHit = 0
-	self.ObsLastEval     = 0
-	self.ObsYawBias      = 0
-	self.ObsAltBias      = 0
-	self.ObsConsecHits   = 0
-
-	-- Boundary recovery cooldown (prevents flip-flop every frame)
-	self.BoundaryFlipTime = 0
+	-- Obstacle evasion (non-sky geometry)
+	self.ObsLastEval   = 0
+	self.ObsYawBias    = Vector(0, 0, 0)  -- flat avoid vector now, not scalar
+	self.ObsAltBias    = 0
+	self.ObsConsecHits = 0
 
 	self.PhysObj = self:GetPhysicsObject()
 	if IsValid(self.PhysObj) then
@@ -194,10 +196,9 @@ function ENT:Initialize()
 	self.ExplodeTimer    = nil
 	self.ExplodedAlready = false
 
-	-- Damage tier
 	self.DamageTier = 0
 
-	self:Debug("Spawned at " .. tostring(spawnPos) .. " OrbitDir=" .. self.OrbitDir)
+	self:Debug("Spawned at " .. tostring(spawnPos) .. " OrbitDir=" .. self.OrbitDirection)
 end
 
 -- ============================================================
@@ -358,68 +359,71 @@ function ENT:Think()
 end
 
 -- ============================================================
--- SKY PROBE EVASION
+-- WALL / SKY AVOIDANCE
+-- Returns a flat avoidance vector (may be zero).
+-- Fires 5 fan probes forward; any hit (sky OR world brush) contributes
+-- a push away from that direction.  This replaces the old SkyYawBias
+-- scalar and the RecoverFromBoundary teleport entirely.
 -- ============================================================
 
-function ENT:EvaluateSkyProbes(forward, pos)
-	local probeOffsets = { -60, -30, 0, 30, 60 }
-	local hitCount     = 0
-	local biasSide     = 0
+function ENT:EvaluateWallProbes(pos)
+	local probeDist  = math.max(1200, self.Speed * 6)
+	local fwdDir     = Angle(0, self.flightYaw, 0):Forward()
+	local fwdRight   = Angle(0, self.flightYaw + 90, 0):Forward()
 
-	for _, yawOff in ipairs(probeOffsets) do
-		local probeAng = Angle(0, self.ang.y + yawOff, 0)
-		local probeDir = probeAng:Forward()
-		probeDir.z     = 0.18
+	-- Fan offsets in degrees relative to flight direction
+	local fanOffsets = { -60, -30, 0, 30, 60 }
+	local avoidVec   = Vector(0, 0, 0)
+
+	for _, yawOff in ipairs(fanOffsets) do
+		local probeDir = Angle(0, self.flightYaw + yawOff, 0):Forward()
+		probeDir.z = 0.12  -- slight upward lean to catch sky ceiling
 		probeDir:Normalize()
 
-		local trSky = util.TraceLine({
+		local tr = util.TraceLine({
 			start  = pos,
-			endpos = pos + probeDir * self.SkyProbeDist,
+			endpos = pos + probeDir * probeDist,
 			filter = self,
 			mask   = MASK_SOLID_BRUSHONLY,
 		})
 
-		if trSky.Hit and trSky.HitSky then
-			hitCount = hitCount + 1
-			if yawOff >= 0 then
-				biasSide = biasSide - 1
-			else
-				biasSide = biasSide + 1
-			end
-		end
-		if trSky.Hit and trSky.HitSky and math.abs(yawOff) <= 30 then
-			self.SkyProbeLastHit = CurTime()
+		if tr.Hit then
+			-- Weight by proximity: closer = stronger push
+			local urgency = 1 + (1 - tr.Fraction) * 3
+			-- Push away from the hit direction (negate that probe's contribution)
+			local awayDir = -probeDir
+			awayDir.z = 0
+			avoidVec = avoidVec + awayDir * urgency
 		end
 	end
 
-	if hitCount > 0 then
-		local urgency = (CurTime() - self.SkyProbeLastHit < 0.5) and 2.0 or 1.0
-		self.SkyYawBias = biasSide * 0.08 * urgency
-	else
-		self.SkyYawBias = self.SkyYawBias * 0.85
-		if math.abs(self.SkyYawBias) < 0.001 then self.SkyYawBias = 0 end
+	if avoidVec:LengthSqr() > 0.001 then
+		avoidVec.z = 0
+		avoidVec:Normalize()
 	end
+
+	return avoidVec
 end
 
 -- ============================================================
--- OBSTACLE PROBE EVASION
+-- OBSTACLE PROBE EVASION  (non-sky world geometry)
+-- Returns a flat avoidance vector.
 -- ============================================================
 
-function ENT:EvaluateObstacleProbes(forward, pos)
+function ENT:EvaluateObstacleProbes(pos)
 	local ct = CurTime()
-	if ct - self.ObsLastEval < 0.08 then return end
+	if ct - self.ObsLastEval < 0.08 then return self.ObsYawBias end
 	self.ObsLastEval = ct
 
 	local probeDist = math.max(800, self.Speed * 3)
-	local yawAngles = { -80, -40, -15, 0, 15, 40, 80 }
-	local hitLeft   = 0
-	local hitRight  = 0
+	local fanAngles = { -80, -40, -15, 0, 15, 40, 80 }
+	local avoidVec  = Vector(0, 0, 0)
+	local totalHits = 0
 	local hitFront  = 0
 
-	for _, yawOff in ipairs(yawAngles) do
-		local probeAng = Angle(0, self.ang.y + yawOff, 0)
-		local probeDir = probeAng:Forward()
-		probeDir.z     = 0
+	for _, yawOff in ipairs(fanAngles) do
+		local probeDir = Angle(0, self.flightYaw + yawOff, 0):Forward()
+		probeDir.z = 0
 
 		local tr = util.TraceLine({
 			start  = pos,
@@ -430,96 +434,43 @@ function ENT:EvaluateObstacleProbes(forward, pos)
 
 		if tr.Hit and not tr.HitSky then
 			local urgency = 1 + (1 - tr.Fraction) * 2
-			if yawOff < -10 then
-				hitLeft  = hitLeft  + urgency
-			elseif yawOff > 10 then
-				hitRight = hitRight + urgency
-			else
+			local awayDir = -probeDir
+			awayDir.z = 0
+			avoidVec = avoidVec + awayDir * urgency
+			totalHits = totalHits + 1
+			if math.abs(yawOff) <= 15 then
 				hitFront = hitFront + urgency
 			end
 		end
 	end
 
-	local totalHits = hitLeft + hitRight + hitFront
 	if totalHits > 0 then
 		self.ObsConsecHits = self.ObsConsecHits + 1
 	else
 		self.ObsConsecHits = 0
 	end
 
+	-- Persistent consecutive hits: flip orbit direction as last resort
 	if self.ObsConsecHits >= 4 then
-		self.OrbitDir      = -self.OrbitDir
-		self.ObsConsecHits = 0
+		self.OrbitDirection = -self.OrbitDirection
+		self.ObsConsecHits  = 0
 		self:Debug("Obstacle escalation: orbit direction reversed")
 	end
 
-	if totalHits > 0 then
-		local urgencyScale = (self.ObsConsecHits >= 2) and 2.0 or 1.0
-		if hitRight > hitLeft then
-			self.ObsYawBias = -0.25 * urgencyScale
-		elseif hitLeft > hitRight then
-			self.ObsYawBias =  0.25 * urgencyScale
-		else
-			self.ObsYawBias = self.OrbitDir * 0.25 * urgencyScale
-		end
-		if hitFront > 1.5 then
-			self.ObsAltBias = math.Rand(120, 260)
-		end
+	if hitFront > 1.5 then
+		self.ObsAltBias = math.Rand(120, 260)
 	else
-		self.ObsYawBias = self.ObsYawBias * 0.80
 		self.ObsAltBias = self.ObsAltBias * 0.92
-		if math.abs(self.ObsYawBias) < 0.001 then self.ObsYawBias = 0 end
-		if math.abs(self.ObsAltBias) < 1     then self.ObsAltBias = 0 end
-	end
-end
-
--- ============================================================
--- BOUNDARY RECOVERY
--- Teleport + full orbit re-seed so the missile never aims back at
--- the wall it just came from. Flips OrbitDir and snaps ang.y to
--- the new tangent so yawCorrection converges inward immediately.
--- ============================================================
-
-function ENT:RecoverFromBoundary(pos, phys)
-	local ct = CurTime()
-	-- cooldown: don't flip more than once per 3 seconds
-	if ct - self.BoundaryFlipTime < 3 then return end
-	self.BoundaryFlipTime = ct
-
-	-- Move to center at cruise altitude
-	local safePos = Vector(self.CenterPos.x, self.CenterPos.y, self.sky)
-	if not util.IsInWorld(safePos) then
-		-- CenterPos itself is outside world -- last resort, just remove
-		self:Debug("CenterPos out of world, removing")
-		self:Remove()
-		return
+		if math.abs(self.ObsAltBias) < 1 then self.ObsAltBias = 0 end
 	end
 
-	self:SetPos(safePos)
-	if IsValid(phys) then phys:SetPos(safePos) end
+	if avoidVec:LengthSqr() > 0.001 then
+		avoidVec.z = 0
+		avoidVec:Normalize()
+	end
+	self.ObsYawBias = avoidVec
 
-	-- Flip orbit direction so next loop goes the other way
-	self.OrbitDir = -self.OrbitDir
-
-	-- Reseed OrbitAngle from the safe position
-	self.OrbitAngle = math.atan2(
-		safePos.y - self.CenterPos.y,
-		safePos.x - self.CenterPos.x
-	)
-
-	-- Snap ang.y to the new tangent so yawCorrection doesn't fight us
-	local newTangentYaw = math.deg(self.OrbitAngle) + 90 * self.OrbitDir
-	self.ang.y  = newTangentYaw
-	self.PrevYaw = newTangentYaw
-	self:SetAngles(Angle(0, newTangentYaw, 0))
-
-	-- Clear evasion biases -- fresh start
-	self.SkyYawBias    = 0
-	self.ObsYawBias    = 0
-	self.ObsAltBias    = 0
-	self.ObsConsecHits = 0
-
-	self:Debug("Boundary recovery: OrbitDir flipped to " .. self.OrbitDir)
+	return avoidVec
 end
 
 -- ============================================================
@@ -530,7 +481,7 @@ function ENT:PhysicsUpdate(phys)
 	if not self.DieTime or not self.sky then return end
 	if CurTime() >= self.DieTime then self:Remove() return end
 
-	-- ---- Destroyed: tumble ----
+	-- ---- Destroyed: tumble (phys authority, no manual steering) ----
 	if self:IsDestroyed() then
 		local dt = FrameTime()
 		if dt <= 0 then dt = 0.01 end
@@ -557,22 +508,14 @@ function ENT:PhysicsUpdate(phys)
 		return
 	end
 
-	-- ---- Normal orbit ----
+	-- ---- Normal orbit (no Havok authority; SetPos only, same as AN-71) ----
 	if self.Diving then return end
 
-	local pos     = self:GetPos()
-	local forward = self:GetForward()
-	local dt      = FrameTime()
+	local pos = self:GetPos()
+	local dt  = engine.TickInterval()
 	if dt <= 0 then dt = 0.01 end
 
-	-- ---- Boundary check FIRST, before any orbit math ----
-	-- Check current pos AND 800 HU ahead so we catch it before it exits
-	local lookAhead = pos + forward * 800
-	if not util.IsInWorld(pos) or not util.IsInWorld(lookAhead) then
-		self:RecoverFromBoundary(pos, phys)
-		return  -- skip rest of this tick; next tick starts clean
-	end
-
+	-- Wandering center
 	self.WanderPhaseX = self.WanderPhaseX + self.WanderRateX
 	self.WanderPhaseY = self.WanderPhaseY + self.WanderRateY
 	self.CenterPos = Vector(
@@ -581,60 +524,109 @@ function ENT:PhysicsUpdate(phys)
 		self.BaseCenterPos.z
 	)
 
-	-- Evasion probes (rad/s biases)
-	self:EvaluateSkyProbes(forward, pos)
-	self:EvaluateObstacleProbes(forward, pos)
-
-	-- Orbit advance
-	local baseAngSpeed = (self.Speed / self.OrbitRadius) * self.OrbitDir
-	self.OrbitAngle = self.OrbitAngle + (baseAngSpeed + self.SkyYawBias + self.ObsYawBias) * dt
-
-	local desiredX = self.CenterPos.x + math.cos(self.OrbitAngle) * self.OrbitRadius
-	local desiredY = self.CenterPos.y + math.sin(self.OrbitAngle) * self.OrbitRadius
-
-	local tangentYaw    = math.deg(self.OrbitAngle) + 90 * self.OrbitDir
-	local yawError      = math.NormalizeAngle(tangentYaw - self.ang.y)
-	local yawCorrection = math.Clamp(yawError * 0.08, -0.6, 0.6)
-	self.ang            = self.ang + Angle(0, yawCorrection, 0)
-
-	self.JitterPhase  = self.JitterPhase  + self.JitterRate1
-	self.JitterPhase2 = self.JitterPhase2 + self.JitterRate2
-	local jitter = math.sin(self.JitterPhase)  * self.JitterAmp1
-	             + math.sin(self.JitterPhase2) * self.JitterAmp2
-
+	-- Altitude drift
 	if CurTime() >= self.AltDriftNextPick then
 		self.AltDriftTarget   = self.sky + math.Rand(-self.AltDriftRange, self.AltDriftRange)
 		self.AltDriftNextPick = CurTime() + math.Rand(10, 25)
 	end
 	self.AltDriftCurrent = Lerp(self.AltDriftLerp, self.AltDriftCurrent, self.AltDriftTarget)
+	self.JitterPhase  = self.JitterPhase  + self.JitterRate1
+	self.JitterPhase2 = self.JitterPhase2 + self.JitterRate2
+	local jitter  = math.sin(self.JitterPhase)  * self.JitterAmp1
+	             + math.sin(self.JitterPhase2) * self.JitterAmp2
 	local liveAlt = self.AltDriftCurrent + jitter + self.ObsAltBias
 
-	local posErr = Vector(desiredX - pos.x, desiredY - pos.y, 0)
-	local vel    = self:GetForward() * self.Speed
-	if posErr:LengthSqr() > 400 then
-		vel = vel + posErr:GetNormalized() * 80
+	-- ---- Steering: AN-71 vector-blend approach ----
+	-- 1. Orbit tangent + radial correction
+	local flatPos    = Vector(pos.x, pos.y, 0)
+	local flatCenter = Vector(self.CenterPos.x, self.CenterPos.y, 0)
+	local toCenter   = flatCenter - flatPos
+	local dist       = toCenter:Length()
+
+	local radialDir = Vector(0, 0, 0)
+	if dist > 1 then radialDir = toCenter / dist end
+
+	local tangentDir = Vector(-radialDir.y, radialDir.x, 0) * self.OrbitDirection
+	if tangentDir:LengthSqr() <= 0.001 then
+		tangentDir = Angle(0, self.flightYaw, 0):Forward()
+		tangentDir.z = 0
+	end
+	tangentDir:Normalize()
+
+	local radialError = 0
+	if self.OrbitRadius > 0 then
+		radialError = math.Clamp((dist - self.OrbitRadius) / self.OrbitRadius, -1, 1)
 	end
 
-	self:SetPos(Vector(pos.x, pos.y, liveAlt))
+	local desiredDir = tangentDir + radialDir * radialError * self.RadialGain
 
-	local rawYawDelta  = math.NormalizeAngle(self.ang.y - (self.PrevYaw or self.ang.y))
-	self.PrevYaw       = self.ang.y
-	local targetRoll   = math.Clamp(rawYawDelta * -25, -30, 30)
-	self.SmoothedRoll  = Lerp(rawYawDelta ~= 0 and 0.15 or 0.05, self.SmoothedRoll, targetRoll)
+	-- 2. Wall / sky avoidance -- blended in with strong authority
+	local wallAvoid = self:EvaluateWallProbes(pos)
+	if wallAvoid:LengthSqr() > 0.001 then
+		desiredDir = desiredDir + wallAvoid * self.WallAvoidGain
+	end
 
-	local physVel      = IsValid(phys) and phys:GetVelocity() or Vector(0,0,0)
-	local forwardSpeed = physVel:Dot(self:GetForward())
-	local speedRatio   = math.Clamp(forwardSpeed / self.Speed, 0, 1)
-	local targetPitch  = math.Clamp(speedRatio * 10, -15, 15)
+	-- 3. Non-sky obstacle avoidance
+	local obsAvoid = self:EvaluateObstacleProbes(pos)
+	if obsAvoid:LengthSqr() > 0.001 then
+		desiredDir = desiredDir + obsAvoid * 1.0
+	end
+
+	desiredDir.z = 0
+	if desiredDir:LengthSqr() <= 0.001 then desiredDir = tangentDir end
+	desiredDir:Normalize()
+
+	-- 4. Yaw toward desiredDir, capped by MaxTurnRate
+	local desiredYaw = desiredDir:Angle().y
+	local yawDiff    = math.NormalizeAngle(desiredYaw - self.flightYaw)
+	local maxStep    = self.MaxTurnRate * dt
+	self.flightYaw   = self.flightYaw + math.Clamp(yawDiff, -maxStep, maxStep)
+
+	-- Roll / pitch smoothing
+	local rawYawDelta  = math.NormalizeAngle(self.flightYaw - (self.PrevYaw or self.flightYaw))
+	self.PrevYaw       = self.flightYaw
+
+	local targetRoll  = math.Clamp(rawYawDelta * -2.5, -30, 30)
+	local rollLerp    = math.abs(rawYawDelta) > 0.01 and 0.15 or 0.05
+	self.SmoothedRoll = Lerp(rollLerp, self.SmoothedRoll, targetRoll)
+
+	local fwdDir      = Angle(0, self.flightYaw, 0):Forward()
+	local vel         = IsValid(phys) and phys:GetVelocity() or (fwdDir * self.Speed)
+	local fwdSpeed    = vel:Dot(fwdDir)
+	local speedRatio  = math.Clamp(fwdSpeed / self.Speed, 0, 1.15)
+	local climbDelta  = math.Clamp((liveAlt - pos.z) / 450, -1, 1)
+	local targetPitch = math.Clamp(speedRatio * 4 + climbDelta * 7, -12, 12)
 	self.SmoothedPitch = Lerp(0.04, self.SmoothedPitch, targetPitch)
 
-	self.ang.p = self.SmoothedPitch
-	self.ang.r = self.SmoothedRoll
-	self:SetAngles(self.ang)
+	self.ang = Angle(
+		self.SmoothedPitch,
+		self.flightYaw,
+		self.SmoothedRoll
+	)
 
-	if IsValid(phys) then
-		phys:SetVelocity(vel)
+	-- Integrate position; Z Lerped toward liveAlt
+	local newPos = pos + fwdDir * self.Speed * dt
+	newPos.z = Lerp(0.08, pos.z, liveAlt)
+
+	-- Last-resort world safety: if the computed next position is out of world
+	-- steer toward center without any teleport.  This should never fire in
+	-- normal play because the probes catch the wall long before we exit.
+	if not util.IsInWorld(newPos) then
+		local rescueDir = flatCenter - Vector(pos.x, pos.y, 0)
+		rescueDir.z = 0
+		if rescueDir:LengthSqr() <= 0.001 then rescueDir = -fwdDir; rescueDir.z = 0 end
+		rescueDir:Normalize()
+		newPos = pos + rescueDir * self.Speed * dt
+		newPos.z = math.min(pos.z, liveAlt)
+		self.flightYaw = rescueDir:Angle().y
+		self.ang = Angle(self.SmoothedPitch, self.flightYaw, self.SmoothedRoll)
+		self:Debug("Out-of-world safety steer fired (probes should have caught this)")
 	end
+
+	self:SetPos(newPos)
+	self:SetAngles(self.ang)
+	-- Do NOT call phys:SetVelocity -- Havok would integrate it on top of
+	-- SetPos and move the entity twice per tick (double-move / stutter).
 end
 
 -- ============================================================
