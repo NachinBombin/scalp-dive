@@ -137,15 +137,17 @@ function ENT:Initialize()
 	self.WanderRateX   = math.Rand(0.004, 0.010)
 	self.WanderRateY   = math.Rand(0.003, 0.009)
 
-	-- Sky / obstacle evasion probes
-	-- Biases are in RADIANS PER SECOND -- scaled by dt in PhysicsUpdate
-	self.SkyYawBias      = 0   -- rad/s additive to OrbitAngSpeed
+	-- Sky / obstacle evasion probes (biases in rad/s)
+	self.SkyYawBias      = 0
 	self.SkyProbeDist    = math.max(1200, self.Speed * 6)
 	self.SkyProbeLastHit = 0
 	self.ObsLastEval     = 0
-	self.ObsYawBias      = 0   -- rad/s additive to OrbitAngSpeed
-	self.ObsAltBias      = 0   -- HU additive to liveAlt
+	self.ObsYawBias      = 0
+	self.ObsAltBias      = 0
 	self.ObsConsecHits   = 0
+
+	-- Boundary recovery cooldown (prevents flip-flop every frame)
+	self.BoundaryFlipTime = 0
 
 	self.PhysObj = self:GetPhysicsObject()
 	if IsValid(self.PhysObj) then
@@ -192,7 +194,7 @@ function ENT:Initialize()
 	self.ExplodeTimer    = nil
 	self.ExplodedAlready = false
 
-	-- Damage tier (0=healthy, 1=light, 2=heavy, 3=dead)
+	-- Damage tier
 	self.DamageTier = 0
 
 	self:Debug("Spawned at " .. tostring(spawnPos) .. " OrbitDir=" .. self.OrbitDir)
@@ -358,13 +360,6 @@ end
 -- ============================================================
 -- SKY PROBE EVASION
 -- ============================================================
--- FIX: biases are now rad/s (not raw radians-per-tick).
--- FIX: biasSide sign corrected -- probe on the RIGHT side hitting sky
---      means steer LEFT (negative yaw when OrbitDir=1), so yawOff>0 => biasSide-=1
---      was already doing that, but the final sign on SkyYawBias was INVERTED.
---      Old:  (biasSide >= 0 and 1 or -1)  -- points TOWARD the wall
---      New:  (biasSide >= 0 and -1 or 1)  -- points AWAY from the wall
--- ============================================================
 
 function ENT:EvaluateSkyProbes(forward, pos)
 	local probeOffsets = { -60, -30, 0, 30, 60 }
@@ -386,8 +381,6 @@ function ENT:EvaluateSkyProbes(forward, pos)
 
 		if trSky.Hit and trSky.HitSky then
 			hitCount = hitCount + 1
-			-- probe right of nose hit sky -> steer left: biasSide--
-			-- probe left  of nose hit sky -> steer right: biasSide++
 			if yawOff >= 0 then
 				biasSide = biasSide - 1
 			else
@@ -401,9 +394,6 @@ function ENT:EvaluateSkyProbes(forward, pos)
 
 	if hitCount > 0 then
 		local urgency = (CurTime() - self.SkyProbeLastHit < 0.5) and 2.0 or 1.0
-		-- biasSide<0 means more right probes hit => steer left => negative rad/s
-		-- biasSide>0 means more left  probes hit => steer right => positive rad/s
-		-- Magnitude: ~0.4 rad/s base, enough to noticeably bend the arc
 		self.SkyYawBias = biasSide * 0.08 * urgency
 	else
 		self.SkyYawBias = self.SkyYawBias * 0.85
@@ -413,10 +403,6 @@ end
 
 -- ============================================================
 -- OBSTACLE PROBE EVASION
--- ============================================================
--- FIX: ObsYawBias now in rad/s, consistent with OrbitAngSpeed units.
---      Old values (0.3 raw) were per-tick which is ~18 deg/tick -- violent.
---      New values (~0.25 rad/s) are gentle and frame-rate independent.
 -- ============================================================
 
 function ENT:EvaluateObstacleProbes(forward, pos)
@@ -469,13 +455,12 @@ function ENT:EvaluateObstacleProbes(forward, pos)
 
 	if totalHits > 0 then
 		local urgencyScale = (self.ObsConsecHits >= 2) and 2.0 or 1.0
-		-- rad/s bias: ~0.25 base, doubled under urgency
 		if hitRight > hitLeft then
-			self.ObsYawBias = -0.25 * urgencyScale  -- obstacle right -> steer left
+			self.ObsYawBias = -0.25 * urgencyScale
 		elseif hitLeft > hitRight then
-			self.ObsYawBias =  0.25 * urgencyScale  -- obstacle left  -> steer right
+			self.ObsYawBias =  0.25 * urgencyScale
 		else
-			self.ObsYawBias = self.OrbitDir * 0.25 * urgencyScale  -- symmetric -> follow orbit dir
+			self.ObsYawBias = self.OrbitDir * 0.25 * urgencyScale
 		end
 		if hitFront > 1.5 then
 			self.ObsAltBias = math.Rand(120, 260)
@@ -486,6 +471,55 @@ function ENT:EvaluateObstacleProbes(forward, pos)
 		if math.abs(self.ObsYawBias) < 0.001 then self.ObsYawBias = 0 end
 		if math.abs(self.ObsAltBias) < 1     then self.ObsAltBias = 0 end
 	end
+end
+
+-- ============================================================
+-- BOUNDARY RECOVERY
+-- Teleport + full orbit re-seed so the missile never aims back at
+-- the wall it just came from. Flips OrbitDir and snaps ang.y to
+-- the new tangent so yawCorrection converges inward immediately.
+-- ============================================================
+
+function ENT:RecoverFromBoundary(pos, phys)
+	local ct = CurTime()
+	-- cooldown: don't flip more than once per 3 seconds
+	if ct - self.BoundaryFlipTime < 3 then return end
+	self.BoundaryFlipTime = ct
+
+	-- Move to center at cruise altitude
+	local safePos = Vector(self.CenterPos.x, self.CenterPos.y, self.sky)
+	if not util.IsInWorld(safePos) then
+		-- CenterPos itself is outside world -- last resort, just remove
+		self:Debug("CenterPos out of world, removing")
+		self:Remove()
+		return
+	end
+
+	self:SetPos(safePos)
+	if IsValid(phys) then phys:SetPos(safePos) end
+
+	-- Flip orbit direction so next loop goes the other way
+	self.OrbitDir = -self.OrbitDir
+
+	-- Reseed OrbitAngle from the safe position
+	self.OrbitAngle = math.atan2(
+		safePos.y - self.CenterPos.y,
+		safePos.x - self.CenterPos.x
+	)
+
+	-- Snap ang.y to the new tangent so yawCorrection doesn't fight us
+	local newTangentYaw = math.deg(self.OrbitAngle) + 90 * self.OrbitDir
+	self.ang.y  = newTangentYaw
+	self.PrevYaw = newTangentYaw
+	self:SetAngles(Angle(0, newTangentYaw, 0))
+
+	-- Clear evasion biases -- fresh start
+	self.SkyYawBias    = 0
+	self.ObsYawBias    = 0
+	self.ObsAltBias    = 0
+	self.ObsConsecHits = 0
+
+	self:Debug("Boundary recovery: OrbitDir flipped to " .. self.OrbitDir)
 end
 
 -- ============================================================
@@ -531,6 +565,14 @@ function ENT:PhysicsUpdate(phys)
 	local dt      = FrameTime()
 	if dt <= 0 then dt = 0.01 end
 
+	-- ---- Boundary check FIRST, before any orbit math ----
+	-- Check current pos AND 800 HU ahead so we catch it before it exits
+	local lookAhead = pos + forward * 800
+	if not util.IsInWorld(pos) or not util.IsInWorld(lookAhead) then
+		self:RecoverFromBoundary(pos, phys)
+		return  -- skip rest of this tick; next tick starts clean
+	end
+
 	self.WanderPhaseX = self.WanderPhaseX + self.WanderRateX
 	self.WanderPhaseY = self.WanderPhaseY + self.WanderRateY
 	self.CenterPos = Vector(
@@ -539,13 +581,11 @@ function ENT:PhysicsUpdate(phys)
 		self.BaseCenterPos.z
 	)
 
-	-- Evasion probes (biases are rad/s; multiplied by dt below)
+	-- Evasion probes (rad/s biases)
 	self:EvaluateSkyProbes(forward, pos)
 	self:EvaluateObstacleProbes(forward, pos)
 
-	-- FIX: OrbitAngSpeed is the BASE rate only.
-	--      Biases (rad/s) are added separately and scaled by dt so they
-	--      are frame-rate independent and don't fight yawCorrection.
+	-- Orbit advance
 	local baseAngSpeed = (self.Speed / self.OrbitRadius) * self.OrbitDir
 	self.OrbitAngle = self.OrbitAngle + (baseAngSpeed + self.SkyYawBias + self.ObsYawBias) * dt
 
@@ -594,23 +634,6 @@ function ENT:PhysicsUpdate(phys)
 
 	if IsValid(phys) then
 		phys:SetVelocity(vel)
-	end
-
-	-- FIX: world-boundary check is now a FORWARD LOOKAHEAD trace (600 HU ahead)
-	--      instead of checking IsInWorld() after the missile already left.
-	--      This catches the problem one tick before the despawn, giving time to recenter.
-	local lookAhead = pos + forward * 600
-	if not util.IsInWorld(lookAhead) or not util.IsInWorld(pos) then
-		self:Debug("Near world boundary -- recentering")
-		local safePos = Vector(self.CenterPos.x, self.CenterPos.y, self.sky)
-		if util.IsInWorld(safePos) then
-			self:SetPos(safePos)
-			if IsValid(phys) then phys:SetPos(safePos) end
-		end
-		self.OrbitAngle = math.atan2(
-			self:GetPos().y - self.CenterPos.y,
-			self:GetPos().x - self.CenterPos.x
-		)
 	end
 end
 
